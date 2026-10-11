@@ -15,6 +15,11 @@
 
 #include "lua_sigmatch.h"
 
+// The vendored sigmatch is patched, so it must not meet another copy of sigmatch in a host that
+// links the static library (stellar-injected uses upstream's): the same inline functions and
+// vtables with different definitions would violate the ODR. Give it its own namespaces.
+#define sigmatch lua_sigmatch_vendored
+#define sigmatch_literals lua_sigmatch_vendored_literals
 #include <sigmatch/sigmatch.hpp>
 
 #include <cmath>
