@@ -6,6 +6,9 @@ processes and in files, from Lua.
 
 - The whole sigmatch API is exposed: signatures, readers, targets, search contexts, the blocking and
   multi-threaded searchers, and search results. Readers and targets can also be written in Lua.
+- Many signatures can be found in a single pass over memory (`signature_set`). On top of that,
+  `sigmatch.bundle` lets hooking code register signatures with callbacks: one `run()` finds
+  everything and, only if all of it was found, runs the callbacks together.
 - It works with LuaJIT and Lua 5.1 to 5.4.
 - It runs on Windows and Linux. Upstream sigmatch is Windows-only; the copy in this repo adds a
   Linux port (see [Vendored sigmatch](#vendored-sigmatch)).
@@ -215,6 +218,103 @@ the search, so the multi-threaded searcher refuses them.
   `tostring`. You can create one with `sigmatch.search_result()`,
   `sigmatch.search_result.make_error(msg)` or `sigmatch.search_result.make_warning(msg)`.
 
+### Signature sets: many signatures, one pass
+
+```lua
+local set = sigmatch.signature_set({ "48 8B 05 ?? ?? ?? ??", "E8 ?? ?? ?? ?? 84 C0", { 0x90, sigmatch._ } })
+local results = ctx:search(set)          -- results[i] is the search_result of set[i]
+```
+
+A `signature_set` is built from a list of signatures (signature objects, strings or byte tables)
+and can't be changed afterwards. `#set`, `set[i]` and `set:signatures()` read it back.
+
+`ctx:search(set)`, `executor:search(set)` and `searcher:search(ranges..., set)` read the memory
+**once** for all signatures and return one `search_result` per signature. Each result is the same
+as searching for that signature on its own, including errors and warnings.
+
+Each signature is anchored on two consecutive fully specified bytes, chosen to avoid bytes that
+are very common in x64 code. Per position of the data, one table lookup finds the few signatures
+worth checking there.
+
+With 500 hook-like signatures (16 to 32 bytes, some bytes wildcarded) over 32 MiB of real x64
+code, a bundled search takes 0.17 s on one thread and 0.06 s on four. Searching for each signature
+separately takes about 14 s and 5 s.
+
+### Bundles: register hooks, find them all, install them together
+
+```lua
+local sigmatch = require("sigmatch")
+
+-- shared by every hooking module
+local hooks = sigmatch.bundle(sigmatch.this_process_target(), {
+    searcher = sigmatch.multi_threaded_searcher,
+    before = function(report) suspend_game_threads() end,  -- optional, around the callbacks
+    after = function(report) resume_game_threads() end,
+})
+
+-- in each hooking module
+hooks:register({
+    name = "CShip::CalcRegenAmount",
+    module = "stellaris.exe", prot = "rx",
+    signatures = { "48 89 5C 24 ?? 57 48 83 EC 20 ...", "the same function in an older patch ..." },
+    callback = function(address, entry) install_hook(address, calc_regen_amount) end,
+})
+
+-- once everything is registered
+local report = hooks:run()
+if not report.ok then
+    print(report.error)  -- e.g. 1 required entry not found: CShip::CalcRegenAmount (0 matches, expected 1)
+end
+```
+
+`sigmatch.bundle(source [, options])` takes either a process target (entries then name a
+`module` and optional `prot`) or a search context (the default region of every entry). The
+options are:
+
+- `searcher`, `threads`, `block_size`: how to search.
+- `before(report)`, `after(report)`: called around the callbacks.
+
+`bundle:register(spec)` returns an entry table that `run()` fills in.
+
+| Field | Meaning |
+|---|---|
+| `signature` or `signatures` | one signature, or alternatives tried in order: the first with the expected number of matches wins |
+| `module`, `prot` / `context` | where to search (default: the bundle's context) |
+| `count` | expected number of matches, default `1`; `false` accepts any number |
+| `offset` | added to every match, default `0` |
+| `required` | default `true`; a missing optional entry is skipped instead of failing the run |
+| `priority` | callbacks run by ascending priority (default `0`), then in registration order |
+| `callback(address, entry)` | `address` is the first match plus `offset` |
+| `name` | used in reports |
+
+After `run()`, an entry has these fields:
+
+- `found`, `address`, `matches` (offset applied)
+- `signature` and `alternative`, the one that matched
+- `result`, the raw `search_result`
+- `error`, why it wasn't found
+
+`bundle:run()` can be called once and works in three steps:
+
+1. **One search per region.** All entries with the same module and protection, or the same
+   context, share one `signature_set` search.
+2. **Check every entry.** An entry is found when one of its alternatives has exactly `count`
+   matches.
+3. **All or nothing.** If a required entry is missing, no callback runs, and the report says
+   what is missing and why. Otherwise `before()` runs, then every callback back to back, then
+   `after()`. If a callback raises an error, the remaining callbacks are skipped, `after()` still
+   runs, and the error propagates.
+
+The report has these fields:
+
+- `ok`
+- `entries`, `failed` (required entries that weren't found) and `skipped` (optional ones)
+- `searches`, the number of bundled searches
+- `error`
+
+Regions are resolved when the bundle runs, so a module only has to be loaded by then.
+`bundle.lua` is compiled into the module.
+
 ### Linux notes
 
 - A module is a file-backed mapping, found by its file name (`"libc.so.6"`, or the executable's
@@ -232,6 +332,10 @@ and with the static library linked into a small host program
 
 - signature parsing (upstream's vectors included) and matching across block and thread
   boundaries
+- signature sets returning the same results as separate searches: randomized signatures,
+  including ones with no fixed byte, on every searcher and target
+- bundles: ordering, one search per region, alternatives, all-or-nothing behaviour, callback
+  errors, running only once
 - every searcher configuration producing identical results
 - process, file and custom targets, and module protections
 - Lua readers (errors, coroutines, nesting, garbage collection)
@@ -255,6 +359,9 @@ and then patched in separate commits:
   - `file_content_reader` broke for good after any read hit the end of the file.
   - The blocking searcher stitched data from both sides of a failed read into false matches.
   - `target` had no virtual destructor.
+- An extension: `signature_set`, searched in one pass by `search_context::search(const
+  signature_set &)` and the executors. The blocking and multi-threaded searchers implement it
+  natively; custom searchers fall back to one search per signature.
 
 Upstream's own test suite passes against the patched header.
 
