@@ -1763,6 +1763,78 @@ private:
 };
 
 //////////////////////////////////////////////////
+///
+/// @brief A set of signatures that are searched for together
+///
+/// Searching for a set reads the data once for all of its signatures instead of once per
+/// signature, which matters when there are many of them. The result is the same as searching for
+/// each signature separately.
+///
+/// @sa search_context::search(const signature_set &) const
+///
+class signature_set final
+{
+public:
+    ///
+    /// @brief Default constructor
+    ///
+    signature_set() noexcept = default;
+
+    ///
+    /// @brief Constructor for multiple signatures
+    ///
+    /// @param[in] signatures The signatures.
+    ///
+    explicit signature_set(std::vector<signature> signatures) noexcept
+        : _signatures{std::move(signatures)}
+    {
+    }
+
+    ///
+    /// @brief Add a signature
+    ///
+    /// @param[in] sig The signature.
+    ///
+    /// @return size_t The index of the signature, which is also the index of its result.
+    ///
+    inline size_t add(signature sig)
+    {
+        _signatures.emplace_back(std::move(sig));
+        return _signatures.size() - 1;
+    }
+
+    ///
+    /// @brief Get the signatures
+    ///
+    /// @return const std::vector<signature> & The signatures.
+    ///
+    [[nodiscard]] constexpr const std::vector<signature> &signatures() const noexcept
+    {
+        return _signatures;
+    }
+
+    ///
+    /// @brief Get the number of signatures
+    ///
+    /// @return size_t The number of signatures.
+    ///
+    [[nodiscard]] constexpr size_t size() const noexcept
+    {
+        return _signatures.size();
+    }
+
+    ///
+    /// @brief Equal to operator
+    ///
+    /// @param[in] rhs A right hand side value.
+    ///
+    [[nodiscard]] bool operator==(const signature_set &rhs) const noexcept = default;
+
+private:
+    std::vector<signature> _signatures;
+};
+
+//////////////////////////////////////////////////
 // matchers
 //
 // (for internal use)
@@ -2208,6 +2280,261 @@ private:
 };
 
 //////////////////////////////////////////////////
+// signature set matching
+//
+// (for internal use)
+//
+
+///
+/// @cond
+///
+
+namespace impl {
+
+// Bytes that are very common in x86 / x64 machine code (and padding). Anchors avoid them so that
+// fewer positions have to be verified.
+inline constexpr std::array<unsigned char, 256> common_code_bytes = [] {
+    std::array<unsigned char, 256> table{};
+    for (const int value : {0x00, 0x01, 0x08, 0x0F, 0x10, 0x20, 0x24, 0x33, 0x40, 0x41, 0x44,
+                            0x45, 0x48, 0x49, 0x4C, 0x4D, 0x74, 0x75, 0x80, 0x83, 0x85, 0x89,
+                            0x8B, 0x8D, 0x90, 0xC0, 0xC3, 0xC7, 0xCC, 0xE8, 0xFF}) {
+        table[value] = 1;
+    }
+    return table;
+}();
+
+} // namespace impl
+
+// Prepares a signature set for single-pass matching.
+//
+// Every signature gets an anchor: two consecutive fully specified bytes, or one if it has no such
+// pair. A table indexed by those bytes gives, for each position of the data, the few signatures
+// that are worth verifying there. Signatures without a fully specified byte are verified at every
+// position.
+class signature_set_index final
+{
+public:
+    explicit inline signature_set_index(const signature_set &set) : _set{set}
+    {
+        const auto &sigs = set.signatures();
+        _infos.reserve(sigs.size());
+
+        // (signature index, table key)
+        std::vector<std::pair<uint32_t, uint32_t>> pair_anchored, byte_anchored;
+
+        for (size_t s = 0; s < sigs.size(); ++s) {
+            const auto &bytes = sigs[s].bytes();
+            const auto index = static_cast<uint32_t>(s);
+
+            sig_info info{_values.size(), bytes.size(), 0};
+            for (const auto &byte : bytes) {
+                _values.push_back(byte.value());
+                _masks.push_back(byte.mask());
+            }
+            _max_size = (std::max)(_max_size, bytes.size());
+
+            if (bytes.empty()) {
+                _infos.push_back(info);
+                continue;
+            }
+
+            const auto fixed = [&](size_t j) { return bytes[j].mask() == std::byte{0xFF}; };
+            const auto commonness = [&](size_t j) {
+                return impl::common_code_bytes[std::to_integer<size_t>(bytes[j].value())];
+            };
+
+            size_t best = bytes.size();
+            unsigned best_score = ~0u;
+            for (size_t j = 0; j + 1 < bytes.size(); ++j) {
+                if (fixed(j) && fixed(j + 1) && commonness(j) + commonness(j + 1) < best_score) {
+                    best = j;
+                    best_score = commonness(j) + commonness(j + 1);
+                }
+            }
+            if (best != bytes.size()) {
+                info.anchor = best;
+                pair_anchored.emplace_back(
+                    index, (std::to_integer<uint32_t>(bytes[best].value()) << 8) |
+                               std::to_integer<uint32_t>(bytes[best + 1].value()));
+                _infos.push_back(info);
+                continue;
+            }
+
+            for (size_t j = 0; j < bytes.size(); ++j) {
+                if (fixed(j) && commonness(j) < best_score) {
+                    best = j;
+                    best_score = commonness(j);
+                }
+            }
+            if (best != bytes.size()) {
+                info.anchor = best;
+                byte_anchored.emplace_back(index, std::to_integer<uint32_t>(bytes[best].value()));
+            }
+            else {
+                _unanchored.push_back(index);
+            }
+            _infos.push_back(info);
+        }
+
+        build_table(_pair_offsets, _pair_entries, 0x10000, pair_anchored);
+        build_table(_byte_offsets, _byte_entries, 0x100, byte_anchored);
+    }
+
+    [[nodiscard]] constexpr const signature_set &set() const noexcept
+    {
+        return _set;
+    }
+
+    [[nodiscard]] constexpr size_t size() const noexcept
+    {
+        return _infos.size();
+    }
+
+    // The size of the longest signature
+    [[nodiscard]] constexpr size_t max_size() const noexcept
+    {
+        return _max_size;
+    }
+
+    // Records, in `results` (one per signature), the matches in `buffer` that end at or after
+    // `new_begin`; the ones that end before were recorded with the previous data. `buffer[0]` is
+    // at address `base`. Matches of each signature are recorded in ascending order.
+    inline void match(
+        std::span<const std::byte> buffer, size_t new_begin, const std::byte *base,
+        std::vector<search_result> &results) const
+    {
+        const std::byte *data = buffer.data();
+        const size_t size = buffer.size();
+
+        const auto verify = [&](uint32_t s, size_t start) {
+            const auto &info = _infos[s];
+            const size_t end = start + info.size;
+            if (end > size || end <= new_begin) {
+                return;
+            }
+            const std::byte *values = _values.data() + info.begin;
+            const std::byte *masks = _masks.data() + info.begin;
+            const std::byte *bytes = data + start;
+            for (size_t j = 0; j < info.size; ++j) {
+                if (((bytes[j] & masks[j]) ^ values[j]) != std::byte{0}) {
+                    return;
+                }
+            }
+            results[s].matches().emplace_back(base + start);
+        };
+
+        if (!_pair_entries.empty()) {
+            for (size_t q = 0; q + 1 < size; ++q) {
+                const size_t key =
+                    (std::to_integer<size_t>(data[q]) << 8) | std::to_integer<size_t>(data[q + 1]);
+                for (uint32_t e = _pair_offsets[key], last = _pair_offsets[key + 1]; e < last; ++e) {
+                    const uint32_t s = _pair_entries[e];
+                    if (q >= _infos[s].anchor) {
+                        verify(s, q - _infos[s].anchor);
+                    }
+                }
+            }
+        }
+
+        if (!_byte_entries.empty()) {
+            for (size_t q = 0; q < size; ++q) {
+                const size_t key = std::to_integer<size_t>(data[q]);
+                for (uint32_t e = _byte_offsets[key], last = _byte_offsets[key + 1]; e < last; ++e) {
+                    const uint32_t s = _byte_entries[e];
+                    if (q >= _infos[s].anchor) {
+                        verify(s, q - _infos[s].anchor);
+                    }
+                }
+            }
+        }
+
+        for (const uint32_t s : _unanchored) {
+            const size_t sig_size = _infos[s].size;
+            const size_t first = new_begin >= sig_size ? new_begin - sig_size + 1 : 0;
+            for (size_t start = first; start + sig_size <= size; ++start) {
+                verify(s, start);
+            }
+        }
+    }
+
+private:
+    struct sig_info
+    {
+        size_t begin; // in `_values` / `_masks`
+        size_t size;
+        size_t anchor; // offset of the anchor in the signature
+    };
+
+    const signature_set &_set;
+    std::vector<sig_info> _infos;
+    std::vector<std::byte> _values, _masks; // all signatures, concatenated
+    size_t _max_size{0};
+
+    // Signatures by anchor, as offsets (one per key, plus one) into the entries
+    std::vector<uint32_t> _pair_offsets, _pair_entries;
+    std::vector<uint32_t> _byte_offsets, _byte_entries;
+    std::vector<uint32_t> _unanchored;
+
+    static inline void build_table(
+        std::vector<uint32_t> &offsets, std::vector<uint32_t> &entries, size_t keys,
+        const std::vector<std::pair<uint32_t, uint32_t>> &items)
+    {
+        if (items.empty()) {
+            return;
+        }
+        offsets.assign(keys + 1, 0);
+        for (const auto &item : items) {
+            ++offsets[item.second + 1];
+        }
+        for (size_t i = 0; i < keys; ++i) {
+            offsets[i + 1] += offsets[i];
+        }
+        entries.resize(items.size());
+        std::vector<uint32_t> next{offsets.begin(), offsets.end() - 1};
+        for (const auto &item : items) {
+            entries[next[item.second]++] = item.first;
+        }
+    }
+};
+
+// Matches a signature set against data that arrives block by block, keeping the tail of the
+// previous blocks for matches that cross block boundaries.
+class signature_set_matcher final
+{
+public:
+    explicit inline signature_set_matcher(const signature_set_index &index) noexcept
+        : _index{index}
+    {
+    }
+
+    inline void reset() noexcept
+    {
+        _buffer.clear();
+    }
+
+    // `data` is at address `base`, right after the previous data (unless reset).
+    inline void match(
+        std::span<const std::byte> data, const std::byte *base, std::vector<search_result> &results)
+    {
+        const size_t tail = _buffer.size();
+        _buffer.insert(_buffer.end(), data.begin(), data.end());
+        _index.match(_buffer, tail, base - tail, results);
+
+        // Matches that end in the next block start in its last `max_size() - 1` bytes at most.
+        const size_t keep = (std::min)(_buffer.size(), _index.max_size() - 1);
+        _buffer.erase(_buffer.begin(), _buffer.end() - static_cast<std::ptrdiff_t>(keep));
+    }
+
+private:
+    const signature_set_index &_index;
+    std::vector<std::byte> _buffer;
+};
+
+///
+/// @endcond
+///
+
+//////////////////////////////////////////////////
 ///
 /// @brief A reader class, which is abstract
 ///
@@ -2269,6 +2596,52 @@ public:
             search(range, sig, result);
         }
     }
+
+    ///
+    /// @brief Perform search for a signature set with multiple ranges
+    ///
+    /// The ranges are read once for all signatures of the set.
+    ///
+    /// @param[in]  ranges  The search ranges.
+    /// @param[in]  set     The signatures to search for.
+    /// @param[out] results The search results, one per signature, in the order of the set.
+    ///
+    inline void search(
+        const std::vector<const_byte_span> &ranges, const signature_set &set,
+        std::vector<search_result> &results) const
+    {
+        if (results.size() < set.size()) {
+            results.resize(set.size());
+        }
+        const signature_set_index index{set};
+        for (const auto &range : ranges) {
+            if (range.size() == 0) {
+                continue;
+            }
+            search(range, index, results);
+        }
+    }
+
+    ///
+    /// @cond
+    ///
+
+    // Searches a single range for a prepared signature set. This default implementation searches
+    // for each signature separately, so that searchers implementing only single signatures keep
+    // working; the library's searchers override it to read the range only once.
+    virtual void search(
+        const const_byte_span &range, const signature_set_index &index,
+        std::vector<search_result> &results) const
+    {
+        const auto &sigs = index.set().signatures();
+        for (size_t i = 0; i < sigs.size(); ++i) {
+            search(range, sigs[i], results[i]);
+        }
+    }
+
+    ///
+    /// @endcond
+    ///
 
 private:
     std::shared_ptr<class reader> _reader;
@@ -2340,6 +2713,67 @@ public:
                 "Some reads failed, the result may be incomplete.");
         }
     }
+
+    ///
+    /// @cond
+    ///
+
+    inline void search(
+        const const_byte_span &range, const signature_set_index &index,
+        std::vector<search_result> &results) const override
+    {
+        if (index.max_size() == 0) {
+            return;
+        }
+
+        const auto for_each_result = [&](const auto &callback) {
+            for (size_t s = 0; s < index.size(); ++s) {
+                callback(results[s]);
+            }
+        };
+
+        if (_block_size == 0) {
+            for_each_result([](search_result &result) {
+                result.error_messages().emplace_back("The value of `block_size` cannot be `0`.");
+            });
+            return;
+        }
+
+        bool reading_failed = false;
+        signature_set_matcher matcher_{index};
+
+        std::vector<std::byte> read_buffer;
+
+        for (size_t i = 0; i < range.size(); i += _block_size) {
+            const auto ptr = range.data() + i;
+            const auto size = (std::min)(_block_size, range.size() - i);
+
+            if (!reader()->read(ptr, size, read_buffer)) {
+                reading_failed = true;
+                matcher_.reset();
+#if defined SIGMATCH_STORE_EACH_READING_FAILURE_WARNING_MESSAGE
+                const auto message = std::format(
+                    "Failed to read {:#x} byte(s) at {}", size, static_cast<const void *>(ptr));
+                for_each_result(
+                    [&](search_result &result) { result.warning_messages().push_back(message); });
+#endif
+            }
+            else {
+                matcher_.match(read_buffer, ptr, results);
+            }
+        }
+
+        if (reading_failed) {
+            for_each_result([](search_result &result) {
+                result.warning_messages().emplace_back(
+                    "Some reads failed, the result may be incomplete.");
+            });
+        }
+    }
+
+    ///
+    /// @endcond
+    ///
 
 private:
     size_t _block_size;
@@ -2436,31 +2870,126 @@ public:
         std::sort(result.matches().begin(), result.matches().end(), std::less<>{});
     }
 
+    ///
+    /// @cond
+    ///
+
+    inline void search(
+        const const_byte_span &range, const signature_set_index &index,
+        std::vector<search_result> &results) const override
+    {
+        if (index.max_size() == 0) {
+            return;
+        }
+
+        if (_threads_max_count == 0) {
+            for (size_t s = 0; s < index.size(); ++s) {
+                results[s].error_messages().emplace_back(
+                    "The value of `threads_max_count` cannot be `0`.");
+            }
+            return;
+        }
+
+        const auto chunks = split_range(range, index.max_size());
+        if (chunks.size() <= 1) {
+            blocking_searcher::search(range, index, results); // search in the current thread directly
+            return;
+        }
+
+        std::vector<std::vector<search_result>> chunk_results(
+            chunks.size(), std::vector<search_result>(index.size()));
+
+        {
+            std::vector<std::thread> threads;
+            threads.reserve(chunks.size());
+
+            // Joins the started threads even if starting another one throws.
+            struct joiner
+            {
+                std::vector<std::thread> &threads;
+                ~joiner()
+                {
+                    for (auto &thread : threads) {
+                        if (thread.joinable()) {
+                            thread.join();
+                        }
+                    }
+                }
+            } join_all{threads};
+
+            for (size_t t = 0; t < chunks.size(); ++t) {
+                threads.emplace_back([this, &chunks, &index, &chunk_results, t] {
+                    blocking_searcher::search(chunks[t], index, chunk_results[t]);
+                });
+            }
+        }
+
+        // merge
+        for (size_t t = 0; t < chunks.size(); ++t) {
+            // Shorter signatures can match entirely inside the overlap with the next chunk, those
+            // matches belong to the next chunk.
+            const std::byte *owned_end = t + 1 < chunks.size() ? chunks[t + 1].data() : nullptr;
+
+            for (size_t s = 0; s < index.size(); ++s) {
+                auto &from = chunk_results[t][s];
+                auto &to = results[s];
+                for (const std::byte *match : from.matches()) {
+                    if (owned_end == nullptr || match < owned_end) {
+                        to.matches().push_back(match);
+                    }
+                }
+                details::insert_vector(to.error_messages(), std::move(from.error_messages()));
+                details::insert_vector(to.warning_messages(), std::move(from.warning_messages()));
+            }
+        }
+
+        // sort, like the single signature search does
+        for (size_t s = 0; s < index.size(); ++s) {
+            std::sort(results[s].matches().begin(), results[s].matches().end(), std::less<>{});
+        }
+    }
+
+    ///
+    /// @endcond
+    ///
+
 private:
     size_t _threads_max_count;
 
     [[nodiscard]] inline std::vector<thread_info>
     assign_tasks(const const_byte_span &range, const signature &sig) const
     {
+        std::vector<thread_info> threads;
+        for (const auto &chunk : split_range(range, sig.size())) {
+            threads.emplace_back(std::thread{}, chunk);
+        }
+        return threads;
+    }
+
+    // Splits `range` into one chunk per thread. Each chunk overlaps the next one by
+    // `sig_size - 1` bytes so that a match crossing their boundary is complete in the first.
+    [[nodiscard]] inline std::vector<const_byte_span>
+    split_range(const const_byte_span &range, size_t sig_size) const
+    {
         const auto [threads_count, average_size] = appropriate_data(range);
 
-        std::vector<thread_info> threads;
-        threads.reserve(threads_count);
+        std::vector<const_byte_span> chunks;
+        chunks.reserve(threads_count);
 
         for (size_t i = 0; i < threads_count; ++i) {
             const auto offset = i * average_size;
             const auto ptr = range.data() + offset;
-            auto size = (std::min)(average_size + sig.size() - 1, range.size() - offset);
+            auto size = (std::min)(average_size + sig_size - 1, range.size() - offset);
 
             const auto next_size = range.size() - offset - size;
             if (i + 1 == threads_count && next_size > 0) {
                 size += next_size;
             }
 
-            threads.emplace_back(std::thread{}, std::span{ptr, size});
+            chunks.emplace_back(ptr, size);
         }
 
-        return threads;
+        return chunks;
     }
 
     // returns `std::pair<threads_count, average_size>`
@@ -2591,6 +3120,18 @@ public:
     ///
     [[nodiscard]] inline search_result search(const signature &sig) const;
 
+    ///
+    /// @brief Perform search for a signature set with the default searcher
+    ///
+    /// The ranges are read once for all signatures of the set.
+    ///
+    /// @param[in] set The signatures.
+    ///
+    /// @return std::vector<search_result> The search results, one per signature, in the order of
+    ///                                    the set.
+    ///
+    [[nodiscard]] inline std::vector<search_result> search(const signature_set &set) const;
+
 private:
     std::vector<const_byte_span> _ranges;
     std::shared_ptr<reader> _reader;
@@ -2655,6 +3196,42 @@ public:
         return result;
     }
 
+    ///
+    /// @brief Perform search for a signature set with the selected searcher
+    ///
+    /// The ranges are read once for all signatures of the set.
+    ///
+    /// @param[in] set The signatures.
+    ///
+    /// @return std::vector<search_result> The search results, one per signature, in the order of
+    ///                                    the set.
+    ///
+    [[nodiscard]] inline std::vector<search_result> search(const signature_set &set) const
+    {
+        const auto errors = [&](std::string error) {
+            return std::vector<search_result>(set.size(), search_result::make_error(std::move(error)));
+        };
+
+        if (_ctx._error.has_value()) {
+            return errors(_ctx._error.value());
+        }
+
+        if (!_ctx._reader) {
+            return errors("No reader.");
+        }
+
+        auto reader_error = _ctx._reader->error();
+        if (reader_error.has_value()) {
+            return errors(std::move(reader_error.value()));
+        }
+
+        std::vector<search_result> results(set.size());
+        if (!_ctx._ranges.empty()) {
+            _searcher.search(_ctx._ranges, set, results);
+        }
+        return results;
+    }
+
 private:
     SearcherT _searcher;
     search_context _ctx;
@@ -2663,6 +3240,11 @@ private:
 inline search_result search_context::search(const signature &sig) const
 {
     return select().search(sig);
+}
+
+inline std::vector<search_result> search_context::search(const signature_set &set) const
+{
+    return select().search(set);
 }
 
 //////////////////////////////////////////////////
