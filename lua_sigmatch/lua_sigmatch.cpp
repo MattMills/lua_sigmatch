@@ -539,9 +539,9 @@ private:
     }
 };
 
-bool is_lua_reader(const std::shared_ptr<sigmatch::reader> &reader) noexcept
+bool is_lua_reader(const sigmatch::reader *reader) noexcept
 {
-    return dynamic_cast<const lua_reader *>(reader.get()) != nullptr;
+    return dynamic_cast<const lua_reader *>(reader) != nullptr;
 }
 
 // Lets a Lua reader call into `L` while in scope. Nesting (a reader callback that searches with
@@ -1561,7 +1561,8 @@ searcher_type check_searcher_type(lua_State *L, int idx)
     return searcher_type::blocking; // unreachable
 }
 
-void check_not_lua_reader(lua_State *L, const std::shared_ptr<sigmatch::reader> &reader)
+// Takes a raw pointer: a temporary shared_ptr argument would leak when the error longjmp()s.
+void check_not_lua_reader(lua_State *L, const sigmatch::reader *reader)
 {
     if (is_lua_reader(reader)) {
         luaL_error(
@@ -1595,8 +1596,7 @@ int searcher_blocking(lua_State *L)
 
 int searcher_multi_threaded(lua_State *L)
 {
-    check_object<reader_box>(L, 1);
-    check_not_lua_reader(L, reader_at(L, 1));
+    check_not_lua_reader(L, check_object<reader_box>(L, 1)->reader.get());
     const auto threads_max_count = opt_size(L, 2, "threads max count");
     const auto block_size = opt_size(L, 3, "block size");
     auto *box = push_object<searcher_box>(L);
@@ -1732,7 +1732,7 @@ int context_select(lua_State *L)
         luaL_argcheck(L, lua_isnoneornil(L, 4), 4, "blocking_searcher takes only a block size");
     }
     else {
-        check_not_lua_reader(L, ctx->reader);
+        check_not_lua_reader(L, ctx->reader.get());
         first = opt_size(L, 3, "threads max count");
         second = opt_size(L, 4, "block size");
     }
