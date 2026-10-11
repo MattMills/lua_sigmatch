@@ -1,0 +1,3 @@
+[submodule "lua_sigmatch/lib/luajit"]
+	path = lua_sigmatch/lib/luajit
+	url = https://github.com/MattMills/LuaJIT.git
