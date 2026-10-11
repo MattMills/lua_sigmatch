@@ -77,22 +77,30 @@
 #include <tuple>
 #include <mutex>
 #include <array>
+#include <chrono>
+#include <memory>
 #include <vector>
 #include <string>
 #include <format>
 #include <thread>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <variant>
 #include <fstream>
 #include <cassert>
 #include <optional>
+#include <algorithm>
+#include <functional>
 #include <filesystem>
+#include <string_view>
 
 //////////////////////////////////////////////////
 // macros
 //
 
-#define SIGMATCH_UNUSED(...) __VA_ARGS__
+#define SIGMATCH_UNUSED(...) static_cast<void>(__VA_ARGS__)
 
 #if defined linux || defined __linux || defined __linux__
     #define SIGMATCH_PLATFORM_LINUX
@@ -126,6 +134,11 @@
     #endif
     #include <windows.h>
     #include <tlhelp32.h>
+#elif defined SIGMATCH_PLATFORM_LINUX
+    #include <cerrno>
+    #include <fcntl.h>
+    #include <unistd.h>
+    #include <sys/types.h>
 #endif
 
 ///
@@ -298,9 +311,9 @@ public:
         "It is recommended that the underlying type is unsigned.");
 
 private:
-    template <class T>
+    template <class U>
     static constexpr inline bool is_operable_v =
-        std::is_same_v<T, enum_flags> || std::is_same_v<T, enum_type>;
+        std::is_same_v<U, enum_flags> || std::is_same_v<U, enum_type>;
 
 public:
     ///
@@ -406,7 +419,7 @@ public:
     template <class RhsT, std::enable_if_t<is_operable_v<RhsT>, int> = 0>
     constexpr enum_flags &operator|=(RhsT rhs) noexcept
     {
-        _value = static_cast<underlying_type>(enum_flags{enum_type{_value}} | rhs);
+        *this = *this | rhs;
         return *this;
     }
 
@@ -422,7 +435,7 @@ public:
     template <class RhsT, std::enable_if_t<is_operable_v<RhsT>, int> = 0>
     constexpr enum_flags &operator&=(RhsT rhs) noexcept
     {
-        _value = static_cast<underlying_type>(enum_flags{enum_type{_value}} & rhs);
+        *this = *this & rhs;
         return *this;
     }
 
@@ -438,7 +451,7 @@ public:
     template <class RhsT, std::enable_if_t<is_operable_v<RhsT>, int> = 0>
     constexpr enum_flags &operator^=(RhsT rhs) noexcept
     {
-        _value = static_cast<underlying_type>(enum_flags{enum_type{_value}} ^ rhs);
+        *this = *this ^ rhs;
         return *this;
     }
 
@@ -528,6 +541,10 @@ private:
 #if defined SIGMATCH_PLATFORM_WINDOWS
     using underlying_type = HANDLE;
     static constexpr underlying_type invalid_value = nullptr;
+#elif defined SIGMATCH_PLATFORM_LINUX
+    // A file descriptor of `/proc/<pid>/mem`
+    using underlying_type = int;
+    static constexpr underlying_type invalid_value = -1;
 #else
     #error "Unimplemented."
 #endif
@@ -536,6 +553,9 @@ public:
     process_handle() noexcept = default;
     constexpr process_handle(std::nullptr_t) noexcept {}
     constexpr process_handle(underlying_type value) noexcept : _value{value} {}
+
+    // Required by `std::unique_ptr` (NullablePointer)
+    [[nodiscard]] constexpr bool operator==(const process_handle &rhs) const noexcept = default;
 
     [[nodiscard]] explicit constexpr operator bool() const noexcept
     {
@@ -559,9 +579,11 @@ struct process_handle_closer
 
     constexpr void operator()(process_handle handle) noexcept
     {
-        if (!handle) {
+        if (handle) {
 #if defined SIGMATCH_PLATFORM_WINDOWS
             CloseHandle(handle.value());
+#elif defined SIGMATCH_PLATFORM_LINUX
+            ::close(handle.value());
 #else
     #error "Unimplemented."
 #endif
@@ -599,6 +621,9 @@ struct consteval_str_buffer
 #if defined SIGMATCH_PLATFORM_WINDOWS
     return unique_process_handle{
         OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)};
+#elif defined SIGMATCH_PLATFORM_LINUX
+    const auto path = std::format("/proc/{}/mem", pid);
+    return unique_process_handle{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
 #else
     #error "Unimplemented."
 #endif
@@ -701,7 +726,7 @@ requires(std::same_as<T, std::string> || std::same_as<T, std::u8string>)
         return {};
     }
 
-    constexpr T::value_type end_char = std::same_as<T, std::string> ? '\0' : u8'\0';
+    constexpr typename T::value_type end_char = std::same_as<T, std::string> ? '\0' : u8'\0';
 
     T utf8(needed, end_char);
     return WideCharToMultiByte(
@@ -710,10 +735,111 @@ requires(std::same_as<T, std::string> || std::same_as<T, std::u8string>)
                ? utf8
                : T{};
 }
+
+#elif defined SIGMATCH_PLATFORM_LINUX
+
+// `wchar_t` is UTF-32 on Linux. Invalid code points are replaced with U+FFFD.
+[[nodiscard]] constexpr std::string wide_char_to_utf8(std::wstring_view wstr)
+{
+    std::string utf8;
+    utf8.reserve(wstr.size());
+
+    for (const wchar_t wch : wstr) {
+        auto cp = static_cast<uint32_t>(wch);
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            cp = 0xFFFD;
+        }
+
+        if (cp < 0x80) {
+            utf8.push_back(static_cast<char>(cp));
+        }
+        else if (cp < 0x800) {
+            utf8.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else if (cp < 0x10000) {
+            utf8.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else {
+            utf8.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    return utf8;
+}
+
 #endif
 
 } // namespace convert
 } // namespace text
+
+#if defined SIGMATCH_PLATFORM_LINUX
+
+namespace procfs {
+
+// A line of `/proc/<pid>/maps`
+struct map_region
+{
+    uintptr_t begin{0}, end{0};
+    enum_flags<mem_prot> prot;
+    uint64_t offset{0};
+    std::string path;
+};
+
+[[nodiscard]] inline std::optional<std::vector<map_region>> read_maps(process_id pid)
+{
+    std::ifstream stream{std::format("/proc/{}/maps", pid)};
+    if (!stream.is_open()) {
+        return std::nullopt;
+    }
+
+    std::vector<map_region> regions;
+    std::string line;
+
+    // Format: "<begin>-<end> <perms> <offset> <dev> <inode> [<path>]"
+    while (std::getline(stream, line)) {
+        unsigned long long begin = 0, end = 0, offset = 0;
+        char perms[5]{};
+        int path_pos = 0;
+
+        if (std::sscanf(
+                line.c_str(), "%llx-%llx %4s %llx %*s %*s %n", &begin, &end, perms, &offset,
+                &path_pos) < 4) {
+            continue;
+        }
+
+        map_region region;
+        region.begin = static_cast<uintptr_t>(begin);
+        region.end = static_cast<uintptr_t>(end);
+        region.offset = static_cast<uint64_t>(offset);
+        if (perms[0] == 'r') {
+            region.prot |= mem_prot::read;
+        }
+        if (perms[1] == 'w') {
+            region.prot |= mem_prot::write;
+        }
+        if (perms[2] == 'x') {
+            region.prot |= mem_prot::execute;
+        }
+        if (path_pos > 0 && static_cast<size_t>(path_pos) < line.size()) {
+            region.path = line.substr(path_pos);
+        }
+
+        regions.emplace_back(std::move(region));
+    }
+
+    return regions;
+}
+
+} // namespace procfs
+
+#endif
+
 } // namespace details
 
 ///
@@ -729,6 +855,8 @@ requires(std::same_as<T, std::string> || std::same_as<T, std::u8string>)
 {
 #if defined SIGMATCH_PLATFORM_WINDOWS
     return process_id{GetCurrentProcessId()};
+#elif defined SIGMATCH_PLATFORM_LINUX
+    return static_cast<process_id>(::getpid());
 #else
     #error "Unimplemented."
 #endif
@@ -798,6 +926,8 @@ class platform_string
 public:
 #if defined SIGMATCH_PLATFORM_WINDOWS
     using string_type = std::wstring;
+#elif defined SIGMATCH_PLATFORM_LINUX
+    using string_type = std::string;
 #else
     #error "Unimplemented."
 #endif
@@ -807,10 +937,12 @@ public:
     ///
     /// @param[in] utf8 A utf-8 string.
     ///
-    constexpr platform_string(const std::u8string &utf8)
+    inline platform_string(const std::u8string &utf8)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = details::text::convert::utf8_to_wide_char(utf8);
+#elif defined SIGMATCH_PLATFORM_LINUX
+        _str.assign(utf8.begin(), utf8.end());
 #else
     #error "Unimplemented."
 #endif
@@ -819,10 +951,13 @@ public:
     ///
     /// @copydoc platform_string(const std::u8string &)
     ///
-    constexpr platform_string(const char8_t *utf8)
+    inline platform_string(const char8_t *utf8)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = details::text::convert::utf8_to_wide_char(utf8);
+#elif defined SIGMATCH_PLATFORM_LINUX
+        const std::u8string_view view{utf8};
+        _str.assign(view.begin(), view.end());
 #else
     #error "Unimplemented."
 #endif
@@ -831,10 +966,12 @@ public:
     ///
     /// @copydoc platform_string(const std::u8string &)
     ///
-    constexpr platform_string(const std::string &utf8)
+    inline platform_string(const std::string &utf8)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = details::text::convert::utf8_to_wide_char(utf8);
+#elif defined SIGMATCH_PLATFORM_LINUX
+        _str = utf8;
 #else
     #error "Unimplemented."
 #endif
@@ -843,10 +980,12 @@ public:
     ///
     /// @copydoc platform_string(const std::u8string &)
     ///
-    constexpr platform_string(const char *utf8)
+    inline platform_string(const char *utf8)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = details::text::convert::utf8_to_wide_char(utf8);
+#elif defined SIGMATCH_PLATFORM_LINUX
+        _str = utf8;
 #else
     #error "Unimplemented."
 #endif
@@ -857,10 +996,12 @@ public:
     ///
     /// @param[in] wstr A wide char string.
     ///
-    constexpr platform_string(const std::wstring &wstr)
+    inline platform_string(const std::wstring &wstr)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = wstr;
+#elif defined SIGMATCH_PLATFORM_LINUX
+        _str = details::text::convert::wide_char_to_utf8(wstr);
 #else
     #error "Unimplemented."
 #endif
@@ -869,10 +1010,12 @@ public:
     ///
     /// @copydoc platform_string(const std::wstring &)
     ///
-    constexpr platform_string(const wchar_t *wstr)
+    inline platform_string(const wchar_t *wstr)
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         _str = wstr;
+#elif defined SIGMATCH_PLATFORM_LINUX
+        _str = details::text::convert::wide_char_to_utf8(wstr);
 #else
     #error "Unimplemented."
 #endif
@@ -947,6 +1090,8 @@ public:
     {
 #if defined SIGMATCH_PLATFORM_WINDOWS
         return details::text::convert::wide_char_to_utf8(_str);
+#elif defined SIGMATCH_PLATFORM_LINUX
+        return _str;
 #else
     #error "Unimplemented."
 #endif
@@ -1306,7 +1451,7 @@ string_split(std::string_view source, std::string_view delimiter, bool exclude_e
     do {
         end_pos = source.find(delimiter, begin_pos);
         auto token = source.substr(begin_pos, end_pos - begin_pos);
-        if (!exclude_empty || exclude_empty && !token.empty()) {
+        if (!exclude_empty || !token.empty()) {
             result.emplace_back(std::move(token));
         }
         begin_pos = end_pos + delimiter.size();
@@ -1641,7 +1786,7 @@ public:
         _last_unmatched.clear();
     }
 
-    [[nodiscard]] constexpr void match(
+    constexpr void match(
         const std::span<std::byte> &data, const std::byte *base,
         std::vector<const std::byte *> &result)
     {
@@ -1802,11 +1947,37 @@ public:
             return false;
         }
         result.resize(size);
+#if defined SIGMATCH_PLATFORM_WINDOWS
         size_t read_size = 0;
         return ReadProcessMemory(
                    _handle.get().value(), address, result.data(), size,
                    reinterpret_cast<SIZE_T *>(&read_size)) &&
                size == read_size;
+#elif defined SIGMATCH_PLATFORM_LINUX
+        const auto base = reinterpret_cast<uintptr_t>(address);
+        size_t read_size = 0;
+        while (read_size < size) {
+    #if defined __USE_LARGEFILE64
+            const auto ret = ::pread64(
+                _handle.get().value(), result.data() + read_size, size - read_size,
+                static_cast<off64_t>(base + read_size));
+    #else
+            const auto ret = ::pread(
+                _handle.get().value(), result.data() + read_size, size - read_size,
+                static_cast<off_t>(base + read_size));
+    #endif
+            if (ret < 0 && errno == EINTR) {
+                continue;
+            }
+            if (ret <= 0) {
+                return false;
+            }
+            read_size += static_cast<size_t>(ret);
+        }
+        return true;
+#else
+    #error "Unimplemented."
+#endif
     }
 
 private:
@@ -1832,7 +2003,9 @@ public:
 
     [[nodiscard]] inline std::optional<std::string> error() const override
     {
-        if (_stream.good()) {
+        // `is_open()` rather than `good()`: a read that hits EOF sets the stream state, but the
+        // file is still usable.
+        if (_stream.is_open()) {
             return std::nullopt;
         }
         return std::format("Failed to open file. ({})", _file_path.string());
@@ -1844,7 +2017,10 @@ public:
         result.resize(size);
 
         std::lock_guard<std::mutex> lock{_read_mutex};
-        _stream.seekg((size_t)address);
+        // Clear the state left by a previous failed read, otherwise `seekg` would be a no-op and
+        // every following read would fail.
+        _stream.clear();
+        _stream.seekg(reinterpret_cast<uintptr_t>(address));
         _stream.read(reinterpret_cast<char *>(result.data()), size);
         return _stream.good();
     }
@@ -2045,7 +2221,8 @@ public:
     ///
     /// @param[in] reader_ The reader.
     ///
-    explicit inline searcher(std::shared_ptr<reader> reader_) noexcept : _reader{std::move(reader_)}
+    explicit inline searcher(std::shared_ptr<class reader> reader_) noexcept
+        : _reader{std::move(reader_)}
     {
     }
 
@@ -2059,7 +2236,7 @@ public:
     ///
     /// @return const std::shared_ptr<reader> & The reader.
     ///
-    [[nodiscard]] constexpr const std::shared_ptr<reader> &reader() const noexcept
+    [[nodiscard]] constexpr const std::shared_ptr<class reader> &reader() const noexcept
     {
         return _reader;
     }
@@ -2146,6 +2323,8 @@ public:
 
             if (!reader()->read(ptr, size, read_buffer)) {
                 reading_failed = true;
+                // The next block is not contiguous with the buffered tail any more.
+                matcher_.reset();
 #if defined SIGMATCH_STORE_EACH_READING_FAILURE_WARNING_MESSAGE
                 result.warning_messages().emplace_back(std::format(
                     "Failed to read {:#x} byte(s) at {}", size, static_cast<const void *>(ptr)));
@@ -2304,7 +2483,7 @@ private:
         return std::make_pair(threads_count, average_size);
     }
 
-    [[nodiscard]] inline void
+    inline void
     search_thread(const const_byte_span &range, const signature &sig, search_result &result) const
     {
         blocking_searcher::search(range, sig, result);
@@ -2326,59 +2505,7 @@ public:
     /// @note Users should not construct this class directly.
     ///
     template <kind_of_searcher SearcherT>
-    class executor
-    {
-    public:
-        ///
-        /// @cond
-        ///
-
-        explicit constexpr executor(search_context ctx, SearcherT searcher_) noexcept
-            : _searcher{std::move(searcher_)}, _ctx{std::move(ctx)}
-        {
-        }
-
-        ///
-        /// @endcond
-        ///
-
-        ///
-        /// @brief Perform search with the selected searcher
-        ///
-        /// @param[in] sig The signature.
-        ///
-        /// @return search_result A search result.
-        ///
-        /// @sa searcher signature sigmatch_literals::operator ""_sig()
-        ///
-        [[nodiscard]] constexpr search_result search(const signature &sig) const
-        {
-            if (_ctx._error.has_value()) {
-                return search_result::make_error(_ctx._error.value());
-            }
-
-            auto reader_error = _ctx._reader->error();
-            if (reader_error.has_value()) {
-                return search_result::make_error(std::move(reader_error.value()));
-            }
-
-            if (!_ctx._reader) {
-                return search_result::make_error("No reader.");
-            }
-
-            if (_ctx._ranges.empty()) {
-                return search_result{};
-            }
-
-            search_result result;
-            _searcher.search(_ctx._ranges, sig, result);
-            return result;
-        }
-
-    private:
-        SearcherT _searcher;
-        search_context _ctx;
-    };
+    class executor;
 
     ///
     /// @brief Default constructor
@@ -2462,16 +2589,81 @@ public:
     ///
     /// @sa searcher signature sigmatch_literals::operator ""_sig()
     ///
-    [[nodiscard]] constexpr search_result search(const signature &sig) const
-    {
-        return select().search(sig);
-    }
+    [[nodiscard]] inline search_result search(const signature &sig) const;
 
 private:
     std::vector<const_byte_span> _ranges;
     std::shared_ptr<reader> _reader;
     std::optional<std::string> _error;
 };
+
+///
+/// @brief Search executor
+///
+/// @tparam SearcherT The searcher type.
+///
+/// @note Users should not construct this class directly.
+///
+// Defined out of class because it stores a `search_context`, which has to be complete.
+template <kind_of_searcher SearcherT>
+class search_context::executor
+{
+public:
+    ///
+    /// @cond
+    ///
+
+    explicit inline executor(search_context ctx, SearcherT searcher_) noexcept
+        : _searcher{std::move(searcher_)}, _ctx{std::move(ctx)}
+    {
+    }
+
+    ///
+    /// @endcond
+    ///
+
+    ///
+    /// @brief Perform search with the selected searcher
+    ///
+    /// @param[in] sig The signature.
+    ///
+    /// @return search_result A search result.
+    ///
+    /// @sa searcher signature sigmatch_literals::operator ""_sig()
+    ///
+    [[nodiscard]] constexpr search_result search(const signature &sig) const
+    {
+        if (_ctx._error.has_value()) {
+            return search_result::make_error(_ctx._error.value());
+        }
+
+        if (!_ctx._reader) {
+            return search_result::make_error("No reader.");
+        }
+
+        auto reader_error = _ctx._reader->error();
+        if (reader_error.has_value()) {
+            return search_result::make_error(std::move(reader_error.value()));
+        }
+
+        if (_ctx._ranges.empty()) {
+            return search_result{};
+        }
+
+        search_result result;
+        _searcher.search(_ctx._ranges, sig, result);
+        return result;
+    }
+
+private:
+    SearcherT _searcher;
+    search_context _ctx;
+};
+
+inline search_result search_context::search(const signature &sig) const
+{
+    return select().search(sig);
+}
 
 //////////////////////////////////////////////////
 // target
@@ -2492,7 +2684,8 @@ public:
     ///
     /// @sa reader
     ///
-    explicit inline target(std::shared_ptr<reader> reader_) noexcept : _reader{std::move(reader_)}
+    explicit inline target(std::shared_ptr<class reader> reader_) noexcept
+        : _reader{std::move(reader_)}
     {
     }
 
@@ -2511,7 +2704,7 @@ public:
     ///
     /// @return const std::shared_ptr<reader> & The reader.
     ///
-    [[nodiscard]] constexpr const std::shared_ptr<reader> &reader() const noexcept
+    [[nodiscard]] constexpr const std::shared_ptr<class reader> &reader() const noexcept
     {
         return _reader;
     }
@@ -2633,7 +2826,13 @@ public:
         }
 
         auto module_info = std::get<process_module_info>(std::move(err_or_mod));
+#if defined SIGMATCH_PLATFORM_LINUX
+        // Unlike PE images, ELF images usually have inaccessible (PROT_NONE) gaps between their
+        // segments, so only the readable parts are searched.
+        return in_range(query_readable(module_info.range));
+#else
         return in_range(module_info.range);
+#endif
     }
 
     ///
@@ -2712,6 +2911,46 @@ private:
         }
 
         return {};
+#elif defined SIGMATCH_PLATFORM_LINUX
+        auto regions = details::procfs::read_maps(_pid);
+        if (!regions.has_value()) {
+            return {};
+        }
+
+        const auto target_name = details::text::to_lower(std::move(module_name.str()));
+
+        // The module spans from its first to its last file-backed mapping.
+        const details::procfs::map_region *first = nullptr;
+        uintptr_t end = 0;
+
+        for (const auto &region : regions.value()) {
+            if (first == nullptr) {
+                if (region.path.empty() || region.path.front() != '/') {
+                    continue;
+                }
+                const auto name = region.path.substr(region.path.rfind('/') + 1);
+                if (details::text::to_lower(name) != target_name) {
+                    continue;
+                }
+                first = &region;
+                end = region.end;
+            }
+            else if (region.path == first->path) {
+                if (region.offset == 0) {
+                    break; // the same file is mapped again, it's another instance
+                }
+                end = (std::max)(end, region.end);
+            }
+        }
+
+        if (first == nullptr) {
+            return {};
+        }
+
+        return process_module_info{
+            .name = first->path.substr(first->path.rfind('/') + 1),
+            .range = {reinterpret_cast<const void *>(first->begin), end - first->begin},
+        };
 #else
     #error "Unimplemented."
 #endif
@@ -2738,7 +2977,7 @@ private:
             target_prot = prot_flags.test(mem_prot::write) ? PAGE_READWRITE : PAGE_READONLY;
         }
 
-        for (const std::byte *i = range.data(); i < range.data() + range.size(); true) {
+        for (const std::byte *i = range.data(); i < range.data() + range.size();) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQueryEx(handle.get().value(), i, &mbi, sizeof(mbi)) != sizeof(mbi)) {
                 break;
@@ -2754,10 +2993,74 @@ private:
         }
 
         return result;
+#elif defined SIGMATCH_PLATFORM_LINUX
+        // Same mapping as the Windows implementation above, e.g. `write` alone means read-write
+        // and no flags means read-only.
+        enum_flags<mem_prot> target_prot = mem_prot::read;
+        if (prot_flags.test(mem_prot::execute)) {
+            if (prot_flags.test(mem_prot::write)) {
+                target_prot = mem_prot::read | mem_prot::write | mem_prot::execute;
+            }
+            else {
+                target_prot = prot_flags.test(mem_prot::read) ? mem_prot::read | mem_prot::execute
+                                                              : mem_prot::execute;
+            }
+        }
+        else if (prot_flags.test(mem_prot::write)) {
+            target_prot = mem_prot::read | mem_prot::write;
+        }
+
+        return query_regions(range, [&](enum_flags<mem_prot> prot) { return prot == target_prot; });
 #else
     #error "Unimplemented."
 #endif
     }
+
+#if defined SIGMATCH_PLATFORM_LINUX
+    [[nodiscard]] inline std::vector<const_byte_span>
+    query_readable(const const_byte_span &range) const
+    {
+        return query_regions(
+            range, [](enum_flags<mem_prot> prot) { return prot.test(mem_prot::read); });
+    }
+
+    // Collects the parts of `range` whose protection satisfies `pred`, adjacent parts are merged so
+    // that matches crossing a mapping boundary are not missed.
+    template <class PredT>
+    [[nodiscard]] inline std::vector<const_byte_span>
+    query_regions(const const_byte_span &range, PredT pred) const
+    {
+        std::vector<const_byte_span> result;
+
+        auto regions = details::procfs::read_maps(_pid);
+        if (!regions.has_value()) {
+            return result;
+        }
+
+        const auto range_begin = reinterpret_cast<uintptr_t>(range.data());
+        const auto range_end = range_begin + range.size();
+
+        for (const auto &region : regions.value()) {
+            const auto begin = (std::max)(region.begin, range_begin);
+            const auto end = (std::min)(region.end, range_end);
+            if (begin >= end || !pred(region.prot)) {
+                continue;
+            }
+
+            if (!result.empty()) {
+                auto &last = result.back();
+                const auto last_begin = reinterpret_cast<uintptr_t>(last.data());
+                if (last_begin + last.size() == begin) {
+                    last = const_byte_span{last.data(), end - last_begin};
+                    continue;
+                }
+            }
+            result.emplace_back(reinterpret_cast<const void *>(begin), end - begin);
+        }
+
+        return result;
+    }
+#endif
 
 private:
     process_id _pid;
