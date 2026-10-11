@@ -2690,6 +2690,24 @@ public:
     }
 
     ///
+    /// @brief Default virtual destructor
+    ///
+    virtual ~target() = default;
+
+    ///
+    /// @cond
+    ///
+
+    target(const target &) = default;
+    target(target &&) noexcept = default;
+    target &operator=(const target &) = default;
+    target &operator=(target &&) noexcept = default;
+
+    ///
+    /// @endcond
+    ///
+
+    ///
     /// @brief Get the optional error in the target.
     ///
     /// @return std::optional<std::string> The optional error.
