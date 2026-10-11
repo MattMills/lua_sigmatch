@@ -793,6 +793,310 @@ test("Lua reader objects are released", function()
 end)
 
 --------------------------------------------------
+-- signature sets (one pass for many signatures)
+--
+
+-- Deterministic on every Lua version (exact in doubles too).
+local function random_source(seed)
+    local state = seed
+    return function(n) -- integer in [0, n)
+        state = (state * 69069 + 1) % 4294967296
+        return math.floor(state / 65536) % n
+    end
+end
+
+-- Data from a small alphabet, so that signatures match often.
+local function random_data(size, rnd)
+    local alphabet = { 0x00, 0x48, 0x8B, 0x05, 0xC3, 0xFF, 0x12, 0x7E }
+    local bytes = {}
+    for i = 1, size do
+        bytes[i] = string.char(alphabet[rnd(#alphabet) + 1])
+    end
+    return table.concat(bytes)
+end
+
+-- Substrings of the data with random wildcards, plus the special cases.
+local function random_signatures(data, count, rnd)
+    local sigs = { sm.signature() } -- empty
+    for i = 2, count do
+        local len = 1 + rnd(28)
+        local pos = rnd(#data - len + 1)
+        local bytes = {}
+        for j = 1, len do
+            local value = data:byte(pos + j)
+            local r = rnd(8)
+            if i % 13 == 0 then
+                bytes[j] = { sm._, value % 16 } -- no fully specified byte at all
+            elseif r == 0 then
+                bytes[j] = sm._
+            elseif r == 1 then
+                bytes[j] = { math.floor(value / 16), sm._ }
+            elseif r == 2 then
+                bytes[j] = { sm._, value % 16 }
+            else
+                bytes[j] = value
+            end
+        end
+        if i % 11 == 0 then -- a single fully specified byte
+            bytes = { sm._, data:byte(pos + 1), { sm._, 0x2 } }
+        end
+        sigs[i] = sm.signature(bytes)
+    end
+    sigs[#sigs + 1] = sigs[5] -- duplicate
+    sigs[#sigs + 1] = sm.signature(string.rep("?? ", 40) .. "48") -- longer than most data runs
+    return sigs
+end
+
+-- Every result of a set search must equal the separate search for its signature.
+local function check_set_equivalence(ctx, sigs, options)
+    options = options or {}
+    local set = sm.signature_set(sigs)
+    local total = 0
+    for _, config in ipairs(configs) do
+        local multi = config[1] == sm.multi_threaded_searcher
+        local tiny = (config[2] and not multi and config[2] < 0x100)
+        if not (multi and options.single_threaded) and not (tiny and options.small_blocks == false) then
+            local searchable = #config == 0 and ctx or ctx:select(unpack(config))
+            local results = searchable:search(set)
+            eq(#results, #sigs, "one result per signature")
+            for i, sig in ipairs(sigs) do
+                local single = searchable:search(sig)
+                if results[i] ~= single then
+                    fail(string.format("[%s] signature #%d (%s): set %s, separately %s", describe(config),
+                        i, tostring(sig), tostring(results[i]), tostring(single)), 2)
+                end
+                total = total + #single
+            end
+        end
+    end
+    return total
+end
+
+test("signature_set basics", function()
+    local set = sm.signature_set({ "48 8B 05", { 0x90, sm._ }, sm.signature("C3") })
+    eq(#set, 3); eq(set:size(), 3)
+    eq(set[1], sm.signature("48 8B 05")); eq(set[3], sm.signature("C3")); eq(set[4], nil)
+    eq(#set:signatures(), 3)
+    check(sm.signature_set(set) == set and not rawequal(sm.signature_set(set), set), "copy")
+    eq(#sm.signature_set(), 0)
+    eq(set.add, nil, "immutable from Lua")
+    eq(tostring(set), "sigmatch.signature_set (3 signatures)")
+    raises(function() sm.signature_set({ "48", "4G" }) end, "bad signature #2 in set")
+    raises(function() sm.signature_set({ "48", 7 }) end, "bad signature #2 in set")
+    raises(function() sm.signature_set("48") end, "list of signatures expected")
+end)
+
+test("signature sets: same results as separate searches (memory, Lua reader)", function()
+    local rnd = random_source(1)
+    local data = random_data(3000, rnd)
+    local target = string_target(data, 0x40000)
+    local sigs = random_signatures(data, 50, rnd)
+    local total = check_set_equivalence(target:in_range(0x40000, #data), sigs, { single_threaded = true })
+    check(total > 1000, "enough matches to compare: " .. total)
+    -- several ranges
+    check_set_equivalence(target:in_range({ { 0x40000, 1000 }, { 0x40000 + 1500, 1500 } }), sigs,
+        { single_threaded = true })
+end)
+
+test("signature sets: same results as separate searches (file, every searcher)", function()
+    local rnd = random_source(2)
+    local data = random_data(0x50000 + 7, rnd)
+    local target = sm.file_target(temp_file("set_equivalence", data))
+    local total = check_set_equivalence(target:in_whole(), random_signatures(data, 60, rnd),
+        { small_blocks = false })
+    check(total > 100000, "enough matches to compare: " .. total)
+end)
+
+test("signature sets: errors and warnings reach every result", function()
+    local set = sm.signature_set({ "00", "01 02" })
+    local results = sm.this_process_target():in_module("lua_sigmatch_no_such_module"):search(set)
+    eq(#results, 2)
+    for i = 1, 2 do
+        eq(results[i]:error_messages()[1], "Module not found or failed. (lua_sigmatch_no_such_module)")
+    end
+    local ctx = sm.file_target(temp_file("set_errors", "\0\1\2")):in_whole()
+    results = ctx:select(sm.blocking_searcher, 0):search(set)
+    eq(results[2]:error_messages()[1], "The value of `block_size` cannot be `0`.")
+    results = ctx:select(sm.multi_threaded_searcher, 0):search(set)
+    eq(results[1]:error_messages()[1], "The value of `threads_max_count` cannot be `0`.")
+    list_eq(ctx:search(set)[2]:matches(), { 1 })
+    eq(#sm.search_context.make_error("x"):search(sm.signature_set()), 0, "empty set")
+
+    -- blocks of 2: [AA BB] [unreadable] [CC DD]
+    local data = hex("AA BB 00 00 CC DD")
+    local reader = sm.reader(function(address, size)
+        if address >= 2 and address < 4 then
+            return nil
+        end
+        return data:sub(address + 1, address + size)
+    end)
+    results = sm.access_memory_target(reader):in_range(0, #data):select(sm.blocking_searcher, 2)
+        :search(sm.signature_set({ "BB CC", "CC DD" }))
+    eq(#results[1], 0, "no match across the unreadable block")
+    list_eq(results[2]:matches(), { 4 })
+    check(results[1]:has_warning() and results[2]:has_warning(), "warnings")
+end)
+
+test("signature sets with searchers used directly and Lua readers", function()
+    local data = planted(5000, hex("CA FE"), { 10, 4000 })
+    local target, reader = string_target(data)
+    local results = sm.blocking_searcher(reader, 0x100):search(0, #data, sm.signature_set({ "CA FE", "FE" }))
+    list_eq(results[1]:matches(), { 10, 4000 })
+    list_eq(results[2]:matches(), { 11, 4001 })
+    results = sm.blocking_searcher(reader):search({ { 0, 100 } }, sm.signature_set({ "CA FE" }))
+    list_eq(results[1]:matches(), { 10 })
+    raises(function() sm.blocking_searcher(reader):search(0, 10, sm.signature_set(), sm.search_result()) end,
+        "no result argument")
+
+    local failing = sm.access_memory_target(sm.reader(function() error("set boom", 0) end))
+    raises(function() failing:in_range(0, 10):search(sm.signature_set({ "00" })) end, "set boom")
+    raises(function() target:in_range(0, 10):select(sm.multi_threaded_searcher) end, "Lua reader")
+end)
+
+--------------------------------------------------
+-- bundles (register, then one run)
+--
+
+-- `size` zero bytes with `items` ({offset, bytes}) written over them
+local function layout(size, items)
+    local buffer = {}
+    for i = 1, size do
+        buffer[i] = "\0"
+    end
+    for _, item in ipairs(items) do
+        for j = 1, #item[2] do
+            buffer[item[1] + j] = item[2]:sub(j, j)
+        end
+    end
+    return table.concat(buffer)
+end
+
+local bundle_data = layout(4096, {
+    { 100, hex("A1 A2 A3 A4") },
+    { 700, hex("B1 B2 B3 B4") },
+    { 2000, hex("C1 C2 C3 C4") },
+    { 3000, hex("C1 C2 C3 C4") },
+})
+
+test("bundle: one search, callbacks in priority order between before and after", function()
+    local target = string_target(bundle_data, 0x10000)
+    local calls = {}
+    local function log(text)
+        calls[#calls + 1] = text
+    end
+    local b = sm.bundle(target:in_range(0x10000, #bundle_data), {
+        before = function(report) log("before:" .. tostring(report.ok)) end,
+        after = function() log("after") end,
+    })
+    local a = b:register({ name = "A", signature = "A1 A2 ?? A4", priority = 2,
+        callback = function(address) log(string.format("A@%x", address)) end })
+    local b_entry = b:register({ name = "B", signature = "B1 B2", offset = 3, priority = 1,
+        callback = function(address, entry) log(string.format("%s@%x", entry.name, address)) end })
+    b:register({ name = "C", signature = "C1 C2 C3 C4", count = 2,
+        callback = function(address, entry) log(string.format("C@%x,%x", address, entry.matches[2])) end })
+    b:register({ name = "none", signature = "EE EE", count = false,
+        callback = function(address, entry) log("none:" .. tostring(address) .. ":" .. #entry.matches) end })
+    b:register({ name = "no callback", signature = "A3 A4" })
+    check(tostring(b):find("5 entries", 1, true), "tostring")
+
+    local report = b:run()
+    check(report.ok, report.error)
+    eq(report.searches, 1, "one bundled search")
+    eq(table.concat(calls, " "), "before:true C@107d0,10bb8 none:nil:0 B@102bf A@10064 after")
+    eq(a.address, 0x10064); eq(a.alternative, 1); check(a.found, "found")
+    eq(b_entry.address, 0x10000 + 700 + 3)
+    eq(b_entry.matches[1], 0x102BF)
+    eq(b_entry.result:matches()[1], 0x10000 + 700, "the raw result has no offset")
+    eq(#report.entries, 5)
+end)
+
+test("bundle: alternatives, optional entries and missing entries", function()
+    local target = string_target(bundle_data)
+    local ctx = target:in_range(0, #bundle_data)
+
+    local b = sm.bundle(ctx)
+    local alt = b:register({ name = "alt", signatures = { "DE AD BE EF", "A1 A2", "B1 B2" } })
+    local opt = b:register({ name = "opt", signature = "DE AD", required = false, callback = error })
+    local report = b:run()
+    check(report.ok, report.error)
+    eq(alt.alternative, 2); eq(alt.address, 100); eq(alt.signature, sm.signature("A1 A2"))
+    eq(#report.skipped, 1); check(not opt.found, "optional not found")
+    eq(opt.error, "0 matches, expected 1")
+
+    local called = {}
+    b = sm.bundle(ctx, { before = function() called.before = true end, after = function() called.after = true end })
+    b:register({ name = "fine", signature = "A1 A2", callback = function() called.fine = true end })
+    local missing = b:register({ name = "missing", signatures = { "DE AD", "C1 C2" } })
+    report = b:run()
+    check(not report.ok, "not ok")
+    eq(report.failed[1], missing)
+    eq(missing.error, "alternative 1: 0 matches, expected 1; alternative 2: 2 matches, expected 1")
+    check(report.error:find("1 required entry not found: missing (", 1, true), report.error)
+    check(next(called) == nil, "nothing runs when a required entry is missing")
+end)
+
+test("bundle: callback errors, one run only, registration errors", function()
+    local target = string_target(bundle_data)
+    local ctx = target:in_range(0, #bundle_data)
+    local log = {}
+    local b = sm.bundle(ctx, { after = function() log[#log + 1] = "after" end })
+    b:register({ name = "first", signature = "A1 A2", callback = function() log[#log + 1] = "first" end })
+    b:register({ name = "bad", signature = "B1 B2", callback = function() error("boom", 0) end })
+    b:register({ name = "never", signature = "C1 C2", count = 2, callback = function() log[#log + 1] = "never" end })
+    raises(function() b:run() end, "callback of bad failed: boom")
+    eq(table.concat(log, " "), "first after")
+    raises(function() b:run() end, "run() can only be called once")
+    raises(function() b:register({ signature = "00" }) end, "after run()")
+
+    b = sm.bundle(ctx)
+    raises(function() b:register({ name = "x", signatures = { "A1", "ZZ" } }) end, "x: signature #2")
+    raises(function() b:register({ name = "y" }) end, "y: no signature")
+    raises(function() b:register({ name = "z", signature = "00", count = -1 }) end, "count")
+    raises(function() b:register({ signature = "00", module = "m" }) end, "process target")
+    raises(function() b:register({ signature = "00", callback = 5 }) end, "callback must be a function")
+    raises(function() b:register({ signature = "00", context = 5 }) end, "context must be a search context")
+    raises(function() sm.bundle():register({ signature = "00" }) end, "no region")
+    raises(function() sm.bundle(42) end, "source must be")
+end)
+
+test("bundle: modules of a process target, one search per region", function()
+    local header = sm.platform == "windows" and "4D 5A" or "7F 45 4C 46"
+    local b = sm.bundle(sm.this_process_target())
+    local version = b:register({ name = "version", module = bindings_module, prot = "r", signature = version_sig })
+    local head = b:register({ name = "header", module = bindings_module, prot = "r", signature = header, count = false })
+    local code = b:register({ name = "code", module = bindings_module, prot = "rx", signature = version_sig, count = 0 })
+    local other = b:register({ name = "other", module = "lua_sigmatch_no_such_module", signature = "00", required = false })
+    local report = b:run()
+    check(report.ok, report.error)
+    eq(report.searches, 3, "regions: module r, module rx, missing module")
+    eq(version.address, sm.this_process_target():in_module(bindings_module):search(version_sig)[1])
+    check(#head.matches >= 1, "module header")
+    check(code.found and code.address == nil, "count = 0")
+    eq(other.error, "Module not found or failed. (lua_sigmatch_no_such_module)")
+end)
+
+test("bundle: multi-threaded searcher option", function()
+    local rnd = random_source(3)
+    local data = random_data(0x40000, rnd)
+    local ctx = sm.file_target(temp_file("bundle_mt", data)):in_whole()
+    local sigs = random_signatures(data, 20, rnd)
+    local blocking, threaded = sm.bundle(ctx), sm.bundle(ctx, { searcher = sm.multi_threaded_searcher, threads = 4 })
+    local by_name = sm.bundle(ctx, { searcher = "blocking", block_size = 0x123 })
+    for i, sig in ipairs(sigs) do
+        if #sig > 0 then
+            for _, b in ipairs({ blocking, threaded, by_name }) do
+                b:register({ name = "s" .. i, signature = sig, count = false })
+            end
+        end
+    end
+    local reports = { blocking:run(), threaded:run(), by_name:run() }
+    for i, entry in ipairs(reports[1].entries) do
+        list_eq(reports[2].entries[i].matches, entry.matches, entry.name .. " multi-threaded")
+        list_eq(reports[3].entries[i].matches, entry.matches, entry.name .. " block size")
+    end
+end)
+
+--------------------------------------------------
 -- LuaJIT FFI memory
 --
 
@@ -823,6 +1127,17 @@ if has_ffi then
         local p = ffi.cast("uint8_t *", result[1])
         eq(p[0], 0x48)
         eq(sm.this_process_memory_reader():read(base + offsets[2], 4), string.char(unpack(pattern)))
+    end)
+
+    test("signature sets over FFI buffers on every searcher", function()
+        local rnd = random_source(4)
+        local data = random_data(0x60000 + 3, rnd)
+        local buffer = ffi.new("uint8_t[?]", #data)
+        ffi.copy(buffer, data, #data)
+        local base = tonumber(ffi.cast("uintptr_t", buffer))
+        local ctx = sm.this_process_target():in_range(base, #data)
+        local total = check_set_equivalence(ctx, random_signatures(data, 60, rnd), { small_blocks = false })
+        check(total > 100000, "enough matches to compare: " .. total)
     end)
 end
 

@@ -94,6 +94,20 @@ else()
 endif()
 
 #
+# bundle.lua (sigmatch.bundle) is compiled into the module as a byte array
+#
+
+set(embedded_lua_source "${CMAKE_CURRENT_SOURCE_DIR}/bundle.lua")
+set(embedded_lua_name "lua_sigmatch_bundle_lua")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${embedded_lua_source}")
+file(READ "${embedded_lua_source}" embedded_lua_hex HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," embedded_lua_bytes "${embedded_lua_hex}")
+string(REPEAT "0x..," 16 embedded_lua_line) # CMake regexes have no {n}
+string(REGEX REPLACE "(${embedded_lua_line})" "\\1\n" embedded_lua_bytes "${embedded_lua_bytes}")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/embedded_lua.h.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/lua_sigmatch_bundle.h" @ONLY)
+
+#
 # Build settings shared by the module and the static library. Linked privately: consumers of
 # the static library only see lua_sigmatch.h and the Lua headers, not C++20 or sigmatch.
 #
@@ -102,6 +116,7 @@ add_library(lua_sigmatch_config INTERFACE)
 target_include_directories(lua_sigmatch_config INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/lib/sigmatch/include"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
   "${lua_include_dir}"
 )
 target_compile_features(lua_sigmatch_config INTERFACE cxx_std_20)
