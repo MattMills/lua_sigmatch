@@ -11,6 +11,7 @@ endif()
 
 option(LUA_SIGMATCH_GHIDRA_FORMAT "Accept Ghidra style signature bytes such as [01..1...]" ON)
 option(LUA_SIGMATCH_STORE_EACH_READING_FAILURE_WARNING "Add a warning to the result for every failed block read" OFF)
+option(LUA_SIGMATCH_BUILD_MODULE "Build the loadable module (sigmatch.so / sigmatch.dll)" ON)
 option(LUA_SIGMATCH_BUILD_STATIC "Build lua_sigmatch_static as part of the default target" OFF)
 set(LUA_SIGMATCH_LUA_INCLUDE_DIR "" CACHE PATH "Lua headers to build against. Empty: the LuaJIT submodule in lib/luajit")
 set(LUA_SIGMATCH_LUA_LIBRARY "" CACHE FILEPATH "Lua library to link: by the module on Windows, by the embedding test everywhere")
@@ -35,8 +36,10 @@ if (LUA_SIGMATCH_LUA_INCLUDE_DIR)
   set(lua_interpreter "${LUA_SIGMATCH_LUA_INTERPRETER}")
   if (WIN32)
     set(lua_library "${LUA_SIGMATCH_LUA_LIBRARY}")
-    if (NOT lua_library)
-      message(FATAL_ERROR "LUA_SIGMATCH_LUA_LIBRARY is required on Windows (e.g. lua51.lib).")
+    if (LUA_SIGMATCH_BUILD_MODULE AND NOT lua_library)
+      message(FATAL_ERROR
+        "The module needs LUA_SIGMATCH_LUA_LIBRARY on Windows (the import library of the Lua DLL, "
+        "e.g. lua51.lib). Hosts that only link lua_sigmatch_static can set LUA_SIGMATCH_BUILD_MODULE=OFF.")
     endif()
   endif()
 elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/luajit/src/lua.h")
@@ -91,7 +94,8 @@ else()
 endif()
 
 #
-# Settings shared by the module and the static library
+# Build settings shared by the module and the static library. Linked privately: consumers of
+# the static library only see lua_sigmatch.h and the Lua headers, not C++20 or sigmatch.
 #
 
 add_library(lua_sigmatch_config INTERFACE)
@@ -122,27 +126,29 @@ endif()
 # Lua module: require("sigmatch")
 #
 
-add_library(lua_sigmatch MODULE "lua_sigmatch.cpp" "lua_sigmatch.h")
-add_library(lua_sigmatch::module ALIAS lua_sigmatch)
-set_target_properties(lua_sigmatch PROPERTIES
-  OUTPUT_NAME "sigmatch"
-  PREFIX ""
-  CXX_EXTENSIONS OFF
-  CXX_VISIBILITY_PRESET hidden
-  VISIBILITY_INLINES_HIDDEN ON
-)
-target_compile_definitions(lua_sigmatch PRIVATE LUA_SIGMATCH_BUILDING)
-target_compile_options(lua_sigmatch PRIVATE ${lua_sigmatch_warnings})
-target_link_libraries(lua_sigmatch PRIVATE lua_sigmatch_config)
-if (lua_library)
-  target_link_libraries(lua_sigmatch PRIVATE "${lua_library}")
-endif()
-if (MINGW)
-  # No libstdc++ / libgcc / winpthread DLLs needed next to sigmatch.dll
-  target_link_options(lua_sigmatch PRIVATE -static)
-endif()
-if (lua_dependency)
-  add_dependencies(lua_sigmatch ${lua_dependency})
+if (LUA_SIGMATCH_BUILD_MODULE)
+  add_library(lua_sigmatch MODULE "lua_sigmatch.cpp" "lua_sigmatch.h")
+  add_library(lua_sigmatch::module ALIAS lua_sigmatch)
+  set_target_properties(lua_sigmatch PROPERTIES
+    OUTPUT_NAME "sigmatch"
+    PREFIX ""
+    CXX_EXTENSIONS OFF
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+  )
+  target_compile_definitions(lua_sigmatch PRIVATE LUA_SIGMATCH_BUILDING)
+  target_compile_options(lua_sigmatch PRIVATE ${lua_sigmatch_warnings})
+  target_link_libraries(lua_sigmatch PRIVATE lua_sigmatch_config)
+  if (lua_library)
+    target_link_libraries(lua_sigmatch PRIVATE "${lua_library}")
+  endif()
+  if (MINGW)
+    # No libstdc++ / libgcc / winpthread DLLs needed next to sigmatch.dll
+    target_link_options(lua_sigmatch PRIVATE -static)
+  endif()
+  if (lua_dependency)
+    add_dependencies(lua_sigmatch ${lua_dependency})
+  endif()
 endif()
 
 #
@@ -152,9 +158,10 @@ endif()
 add_library(lua_sigmatch_static STATIC "lua_sigmatch.cpp" "lua_sigmatch.h")
 add_library(lua_sigmatch::static ALIAS lua_sigmatch_static)
 set_target_properties(lua_sigmatch_static PROPERTIES CXX_EXTENSIONS OFF)
+target_include_directories(lua_sigmatch_static PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${lua_include_dir}")
 target_compile_definitions(lua_sigmatch_static PUBLIC LUA_SIGMATCH_STATIC)
 target_compile_options(lua_sigmatch_static PRIVATE ${lua_sigmatch_warnings})
-target_link_libraries(lua_sigmatch_static PUBLIC lua_sigmatch_config)
+target_link_libraries(lua_sigmatch_static PRIVATE lua_sigmatch_config)
 if (NOT LUA_SIGMATCH_BUILD_STATIC)
   set_target_properties(lua_sigmatch_static PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()

@@ -6,14 +6,14 @@
 
 set(test_script "${CMAKE_CURRENT_SOURCE_DIR}/test_sigmatch.lua")
 
-if (lua_interpreter)
+if (lua_interpreter AND TARGET lua_sigmatch)
   add_test(NAME lua_sigmatch_module
     COMMAND "${lua_interpreter}" "${test_script}"
             "$<TARGET_FILE_DIR:lua_sigmatch>" "$<TARGET_FILE_NAME:lua_sigmatch>"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
   )
 else()
-  message(STATUS "lua_sigmatch: no Lua interpreter (LUA_SIGMATCH_LUA_INTERPRETER), the module test is not registered")
+  message(STATUS "lua_sigmatch: no module or no Lua interpreter (LUA_SIGMATCH_LUA_INTERPRETER), the module test is not registered")
 endif()
 
 if (lua_link_library)
